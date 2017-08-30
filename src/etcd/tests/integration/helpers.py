@@ -1,100 +1,139 @@
+import json
 import shutil
 import subprocess
-import tempfile
 import logging
 import time
 import hashlib
 import uuid
 
 from OpenSSL import crypto
-
+from flocker.control.functional.test_persistence_etcd import ETCD_IMAGE
 
 class EtcdProcessHelper(object):
-
     def __init__(
             self,
-            base_directory,
-            proc_name='etcd',
+            directory=None,
+            proc_name='docker-compose',
             port_range_start=4001,
             internal_port_range_start=7001,
             cluster=False,
             tls=False
     ):
 
-        self.base_directory = base_directory
+        self.directory = directory
         self.proc_name = proc_name
         self.port_range_start = port_range_start
         self.internal_port_range_start = internal_port_range_start
-        self.processes = {}
         self.cluster = cluster
         self.schema = 'http://'
+        self.compose_args = 'etcd_network:\n \
+                  container_name: etcd_test_network\n \
+                  image: %s\n \
+                  privileged: true\n \
+                  hostname: etcd_network\n \
+                  command:\n \
+                    - /bin/bash\n \
+                    - -c\n \
+                    - "while true; do sleep 1; echo `date`;done"\n' % ETCD_IMAGE
         if tls:
             self.schema = 'https://'
 
-    def run(self, number=1, proc_args=[]):
-        if number > 1:
-            initial_cluster = ",".join([ "test-node-{}={}127.0.0.1:{}".format(slot, 'http://', self.internal_port_range_start + slot) for slot in range(0, number)])
-            proc_args.extend([
-                '-initial-cluster', initial_cluster,
-                '-initial-cluster-state', 'new'
-            ])
-        else:
-            proc_args.extend([
-                '-initial-cluster', 'test-node-0=http://127.0.0.1:{}'.format(self.internal_port_range_start),
-                '-initial-cluster-state', 'new'
-            ])
+    def command_run(self, arguments, logger):
+        process = subprocess.Popen(arguments, stderr=subprocess.PIPE,
+                                   stdin=subprocess.PIPE)
+        error = process.communicate(input=self.compose_args)
+        logger.debug('Started %d' % process.pid)
+        logger.debug('Params: %s' % self.compose_args)
+        time.sleep(2)
+        arguments = ["docker", "inspect", "etcd_test_network"]
+        process_getip = subprocess.Popen(arguments, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                         stdin=subprocess.PIPE)
+        logger.debug('Started %d' % process_getip.pid)
+        logger.debug('Params: %s' % arguments)
+        output = process_getip.stdout.read()
+        status = process_getip.wait()
+        time.sleep(2)
+        res = json.loads(output)
+        self.ipaddr = res[0]['NetworkSettings']['Networks']['bridge']['IPAddress']
 
+    def run(self, number=1, proc_args={}):
+        cluster_members = ''
         for i in range(0, number):
-            self.add_one(i, proc_args)
+            member = 'node%d=http://etcd_network:%d,' % (i, self.internal_port_range_start + i)
+            cluster_members += member
+        cluster_members = cluster_members[:-1]
+        for i in range(0, number):
+            self.add_one(i, cluster_members, proc_args)
+
+        log = logging.getLogger()
+        arguments = ["%s" % self.proc_name, "-f", "-", "up", "-d"]
+        self.command_run(arguments=arguments, logger=log)
+        log.debug('Created directory %s' % self.directory)
 
     def stop(self):
         log = logging.getLogger()
-        for key in [k for k in self.processes.keys()]:
-            self.kill_one(key)
-
-    def add_one(self, slot, proc_args=None):
-        log = logging.getLogger()
-        directory = tempfile.mkdtemp(
-            dir=self.base_directory,
-            prefix='python-etcd.%d-' % slot)
-
-        log.debug('Created directory %s' % directory)
-        client = '%s127.0.0.1:%d' % (self.schema, self.port_range_start + slot)
-        peer = '%s127.0.0.1:%d' % ('http://', self.internal_port_range_start
-                                   + slot)
-        daemon_args = [
-            self.proc_name,
-            '-data-dir', directory,
-            '-name', 'test-node-%d' % slot,
-            '-initial-advertise-peer-urls', peer,
-            '-listen-peer-urls', peer,
-            '-advertise-client-urls', client,
-            '-listen-client-urls', client
-        ]
-
-        if proc_args:
-            daemon_args.extend(proc_args)
-
-        daemon = subprocess.Popen(daemon_args)
-        log.debug('Started %d' % daemon.pid)
-        log.debug('Params: %s' % daemon_args)
+        arguments = ["%s" % self.proc_name, "-f", "-", "kill"]
+        kill_process = subprocess.Popen(arguments, stderr=subprocess.PIPE,
+                                        stdin=subprocess.PIPE)
+        output, error = kill_process.communicate(input=self.compose_args)
+        if self.directory != None:
+            shutil.rmtree(self.directory)
         time.sleep(2)
-        self.processes[slot] = (directory, daemon)
+        log.debug('Kill etcd cluster pid:%d' % kill_process.pid)
+        log.debug('Delete directorty %s' % self.directory)
+
+    def add_one(self, slot, cluster_members, proc_args=None):
+        client = '%setcd_network:%d' % (self.schema, self.port_range_start + slot)
+        peer = '%setcd_network:%d' % ('http://', self.internal_port_range_start
+                                      + slot)
+        token = 'etcd-cluster-test'
+
+        self.compose_args += '\netcd%d:\n \
+              container_name: etcd_test_%d\n \
+              image: %s\n \
+              net: "container:etcd_network"\n \
+              volumes:\n \
+                - %s:%s\n \
+              command:\n \
+                - etcd\n \
+                - --name\n \
+                - node%d\n \
+                - --data-dir\n \
+                - /var/tmp/etcd/test\n \
+                - --listen-client-urls\n \
+                - %s\n \
+                - --advertise-client-urls\n \
+                - %s\n \
+                - --listen-peer-urls\n \
+                - %s\n \
+                - --initial-advertise-peer-urls\n \
+                - %s\n \
+                - --initial-cluster\n \
+                - %s\n \
+                - --initial-cluster-token\n \
+                - %s\n \
+                - --initial-cluster-state\n \
+                - new\n' % (slot, slot, ETCD_IMAGE, self.directory, self.directory, slot,
+                            client, client, peer, peer, cluster_members, token)
+
+        for key in proc_args.keys():
+            self.compose_args += '                 - -%s\n \
+                - %s\n' % (key, proc_args[key])
 
     def kill_one(self, slot):
         log = logging.getLogger()
-        data_dir, process = self.processes.pop(slot)
-        process.kill()
-        time.sleep(2)
-        log.debug('Killed etcd pid:%d', process.pid)
-        shutil.rmtree(data_dir)
-        log.debug('Removed directory %s' % data_dir)
+        arguments = ["%s" % self.proc_name, "-f", "-", "kill", "etcd%d" % slot]
+        kill_process = subprocess.Popen(arguments, stderr=subprocess.PIPE,
+                                        stdin=subprocess.PIPE)
+        output, error = kill_process.communicate(input=self.compose_args)
+        time.sleep(1)
+        log.debug('Killed etcd pid:%d', kill_process.pid)
 
 
 class TestingCA(object):
 
     @classmethod
-    def create_test_ca_certificate(cls, cert_path, key_path, cn=None):
+    def create_test_ca_certificate(self, cert_path, key_path, cn=None):
         k = crypto.PKey()
         k.generate_key(crypto.TYPE_RSA, 4096)
         cert = crypto.X509()
@@ -146,7 +185,7 @@ class TestingCA(object):
         return cert, k
 
     @classmethod
-    def create_test_certificate(cls, ca, ca_key, cert_path, key_path, cn=None):
+    def create_test_certificate(self, ca, ca_key, cert_path, key_path, cn=None):
         k = crypto.PKey()
         k.generate_key(crypto.TYPE_RSA, 4096)
         cert = crypto.X509()
@@ -185,7 +224,6 @@ class TestingCA(object):
         cert.set_issuer(ca.get_subject())
         cert.set_pubkey(k)
         cert.set_serial_number(serial)
-
         cert.sign(ca_key, 'sha1')
 
         with open(cert_path, 'w') as f:
